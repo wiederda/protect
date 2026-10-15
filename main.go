@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	osuser "os/user"
 	"runtime"
 	"strings"
 	"syscall"
@@ -37,7 +38,7 @@ type profileInfo struct {
 	Profile     syscall.Handle
 }
 
-const usageText = `protect.exe - schreibt DPAPI-geschützte Werte in die Registry (HKCU) eines anderen Benutzers
+const usageText = `protect.exe - schreibt DPAPI-geschützte Werte in die Registry (HKCU) eines Benutzers
 
 Aufruf:
   protect.exe <Key-Pfad> name=wert [name=wert ...]
@@ -49,25 +50,52 @@ Argumente:
   name=wert     Registry-Wertname und Klartext-Wert; beliebig viele möglich
                 (vorhandene Werte gleichen Namens werden überschrieben)
 
-Zugangsdaten des Zielbenutzers (Umgebungsvariablen):
+Zielbenutzer (Umgebungsvariablen):
   T_USER        Benutzername
-  T_DOMAIN      Domäne, bei lokalen Konten "." oder der Rechnername
-  T_PASS        Passwort (optional; wenn nicht gesetzt, wird es verdeckt abgefragt)
+  T_DOMAIN      Domäne; bei lokalen Konten "." oder der Rechnername
+                Fehlt T_DOMAIN, wird die Domäne des aktuell angemeldeten
+                Benutzers verwendet.
+                Achtung: Für lokale Zielkonten T_DOMAIN=. setzen, wenn Sie selbst
+                mit einem Domänenkonto angemeldet sind.
+  T_PASS        Passwort des Zielbenutzers (optional; wenn nicht gesetzt, wird es
+                verdeckt abgefragt)
+
+  Sind weder T_USER noch T_DOMAIN gesetzt, wird für den aktuell angemeldeten
+  Benutzer geschrieben. Dann ist kein Passwort und kein Administrator nötig.
+  T_DOMAIN ohne T_USER ist nicht erlaubt.
 
 Voraussetzungen:
-  - Als Administrator starten (nötig für LoadUserProfile)
+  - Für einen anderen Benutzer als Administrator starten (nötig für LoadUserProfile)
   - Entschlüsseln kann den Wert danach nur der Zielbenutzer auf diesem Rechner
 
-Beispiel:
-  set T_USER=test
-  set T_DOMAIN=.
-  protect.exe "Software\MeineAnwendung" pass1=abc pass2=def pass3=ghi
+Beispiele:
+  Anderer Benutzer (lokales Dienstkonto):
+    set T_USER=test
+    set T_DOMAIN=.
+    protect.exe "Software\MeineAnwendung" pass1=abc pass2=def pass3=ghi
+
+  Aktuell angemeldeter Benutzer:
+    protect.exe "Software\MeineAnwendung" pass1=abc
 
 Exitcodes:
   0 = OK, 1 = Fehler bei der Ausführung, 2 = falsche Argumente
 `
 
 func usage() { fmt.Print(usageText) }
+
+// Domäne und Name des aktuell angemeldeten Benutzers
+// ("DOMAIN\name" bzw. "RECHNERNAME\name" bei lokalen Konten)
+func currentDomainUser() (domain, name string, err error) {
+	u, err := osuser.Current()
+	if err != nil {
+		return "", "", err
+	}
+	d, n, ok := strings.Cut(u.Username, `\`)
+	if !ok {
+		return ".", u.Username, nil
+	}
+	return d, n, nil
+}
 
 // Liest eine Zeile von der Konsole ohne Echo.
 func readPassword(prompt string) (string, error) {
@@ -106,7 +134,31 @@ func protectOne(secret string) (string, error) {
 	return base64.StdEncoding.EncodeToString(enc), nil
 }
 
-// Schreibt beliebig viele Werte unter HKCU\<keyPath> des Zielbenutzers.
+// Schreibt Werte direkt unter HKCU\<keyPath> des aktuellen Benutzers
+// (kein Logon, kein Passwort, keine Adminrechte nötig).
+func protectSelf(keyPath string, values map[string]string) error {
+	encrypted := make(map[string]string, len(values))
+	for name, secret := range values {
+		b64, err := protectOne(secret)
+		if err != nil {
+			return fmt.Errorf("Wert '%s': %w", name, err)
+		}
+		encrypted[name] = b64
+	}
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, keyPath, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("CreateKey: %w", err)
+	}
+	defer k.Close()
+	for name, b64 := range encrypted {
+		if err := k.SetStringValue(name, b64); err != nil {
+			return fmt.Errorf("SetStringValue '%s': %w", name, err)
+		}
+	}
+	return nil
+}
+
+// Schreibt beliebig viele Werte unter HKCU\<keyPath> eines anderen Benutzers.
 func protectAs(user, domain, pass, keyPath string, values map[string]string) error {
 	u, _ := syscall.UTF16PtrFromString(user)
 	d, _ := syscall.UTF16PtrFromString(domain)
@@ -181,17 +233,30 @@ func main() {
 	}
 
 	user, domain, pass := os.Getenv("T_USER"), os.Getenv("T_DOMAIN"), os.Getenv("T_PASS")
-	if user == "" {
-		fmt.Println("Fehler: T_USER muss gesetzt sein.")
+
+	// Ziel ist ein ausdrücklich angegebenes Konto (nicht der aktuelle Benutzer).
+	// Muss VOR dem switch berechnet werden, da user/domain dort befüllt werden.
+	fremd := user != "" || domain != ""
+
+	curDomain, curUser, err := currentDomainUser()
+	if err != nil {
+		fmt.Println("Fehler: aktueller Benutzer nicht ermittelbar:", err)
+		os.Exit(1)
+	}
+	switch {
+	case !fremd: // weder T_USER noch T_DOMAIN: aktueller Benutzer
+		user, domain = curUser, curDomain
+	case user == "": // Domäne ohne Benutzer
+		fmt.Println("Fehler: T_DOMAIN gesetzt, aber T_USER fehlt.")
 		fmt.Println("Hilfe: protect.exe -h")
 		os.Exit(2)
+	case domain == "": // nur T_USER: aktuelle Domäne
+		domain = curDomain
 	}
-	if domain == "" {
-		domain = "."
-	}
-	if pass == "" {
-		var err error
-		if pass, err = readPassword("Passwort für " + domain + "\\" + user + ": "); err != nil || pass == "" {
+
+	// Passwort nur nötig, wenn für ein anderes Konto geschrieben wird
+	if fremd && pass == "" {
+		if pass, err = readPassword("Passwort für " + domain + `\` + user + ": "); err != nil || pass == "" {
 			fmt.Println("Fehler: kein Passwort eingegeben.", err)
 			os.Exit(2)
 		}
@@ -208,9 +273,15 @@ func main() {
 		values[name] = val
 	}
 
-	if err := protectAs(user, domain, pass, os.Args[1], values); err != nil {
-		fmt.Println("Fehler:", err)
+	var werr error
+	if fremd {
+		werr = protectAs(user, domain, pass, os.Args[1], values)
+	} else {
+		werr = protectSelf(os.Args[1], values)
+	}
+	if werr != nil {
+		fmt.Println("Fehler:", werr)
 		os.Exit(1)
 	}
-	fmt.Println("OK:", len(values), "Wert(e) geschrieben")
+	fmt.Println("OK:", len(values), "Wert(e) geschrieben für", domain+`\`+user)
 }
